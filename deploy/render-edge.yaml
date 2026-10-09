@@ -1,0 +1,18 @@
+# Render Blueprint для сервиса vn-edge. В аккаунте Render: New → Blueprint → репозиторий → путь deploy/render-edge.yaml
+services:
+  - type: web
+    name: vn-edge
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./edge/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: MAIN_URL
+        sync: false
+      - key: SWARM_SECRET
+        sync: false
+      - key: EDGE_REGION
+        value: frankfurt   # поменяй вместе с region выше

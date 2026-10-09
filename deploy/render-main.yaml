@@ -1,0 +1,28 @@
+# Render Blueprint для сервиса vn-main. В аккаунте Render: New → Blueprint → репозиторий → путь deploy/render-main.yaml
+services:
+  - type: web
+    name: vn-main
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./main/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BLOMP_USER
+        sync: false
+      - key: BLOMP_PASS
+        sync: false
+      - key: SWARM_SECRET
+        sync: false
+      - key: BOT_SECRET
+        sync: false
+      - key: ENCODER_TOKEN
+        sync: false
+      - key: BOT_URL
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: ADMIN_TG_IDS
+        sync: false

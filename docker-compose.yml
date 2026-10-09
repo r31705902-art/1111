@@ -1,0 +1,25 @@
+# Local all-in-one stack for testing:  cp env/main.env.example env/main.env (fill in) && docker compose up --build
+services:
+  main:
+    build: { context: ., dockerfile: main/Dockerfile }
+    env_file: env/main.env
+    environment: { PORT: "8080", PUBLIC_URL: "http://localhost:8080", BOT_URL: "http://bot:10000" }
+    ports: ["8080:8080"]
+    volumes: ["vn-data:/data"]
+  edge1:
+    build: { context: ., dockerfile: edge/Dockerfile }
+    environment: { MAIN_URL: "http://main:8080", SWARM_SECRET: "${SWARM_SECRET:-dev-swarm-secret}", PUBLIC_URL: "http://localhost:10001", NODE_ID: "edge-local-1", EDGE_REGION: "frankfurt" }
+    ports: ["10001:10000"]
+  edge2:
+    build: { context: ., dockerfile: edge/Dockerfile }
+    environment: { MAIN_URL: "http://main:8080", SWARM_SECRET: "${SWARM_SECRET:-dev-swarm-secret}", PUBLIC_URL: "http://localhost:10002", NODE_ID: "edge-local-2", EDGE_REGION: "singapore" }
+    ports: ["10002:10000"]
+  bot:
+    build: { context: ., dockerfile: bot/Dockerfile }
+    env_file: env/bot.env
+    environment: { MAIN_URL: "http://main:8080", SITE_URL: "http://localhost:8080" }
+  encoder:
+    build: { context: ., dockerfile: encoder/Dockerfile }
+    environment: { MAIN_URL: "http://main:8080", ENCODER_TOKEN: "${ENCODER_TOKEN:-dev-encoder-token}", ENCODER_NAME: "local-docker" }
+    volumes: ["./data/encoder:/work"]
+volumes: { vn-data: {} }

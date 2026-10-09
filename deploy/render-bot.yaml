@@ -1,0 +1,20 @@
+# Render Blueprint для сервиса vn-bot. В аккаунте Render: New → Blueprint → репозиторий → путь deploy/render-bot.yaml
+services:
+  - type: web
+    name: vn-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./bot/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAIN_URL
+        sync: false
+      - key: SITE_URL
+        sync: false
+      - key: BOT_SECRET
+        sync: false
