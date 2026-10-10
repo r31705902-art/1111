@@ -68,7 +68,7 @@ module.exports = (app, r) => {
   r.get('/api/videos/:id', (req) => {
     const { v, u } = getVideo(req, req.params.id);
     const media = v.media ? JSON.parse(v.media) : null;
-    const out = { ...card(v), description: v.description, chapters: JSON.parse(v.chapters || '[]'), status: v.status, visibility: v.visibility, qualities: media ? media.renditions.map((x) => ({ h: x.h, codec: x.codec.slice(0, 4) })) : [], sb: media?.sb || null };
+    const out = { ...card(v), description: v.description, chapters: JSON.parse(v.chapters || '[]'), status: v.status, visibility: v.visibility, qualities: media ? media.renditions.map((x) => ({ h: x.h, codec: x.codec.slice(0, 4) })) : [], sb: media?.sb || null, subs: media?.subs ? { n: media.subs.n || 0, speakers: media.subs.speakers || 0 } : null };
     out.watching = swarm.liveViewers().per[v.id] || 0;
     if (u) {
       out.fav = !!db.get('SELECT 1 FROM favorites WHERE user_id = ? AND video_id = ?', u.id, v.id);
@@ -226,12 +226,13 @@ module.exports = (app, r) => {
   // ---------- encoder ----------
   const encAuth = (req) => { if (!safeEq(bearer(req), cfg.encoderToken)) fail(401, 'encoder auth'); };
   app.encoders = new Map();
-  const jobOut = (j) => { const v = db.get('SELECT * FROM videos WHERE id = ?', j.video_id); return { id: j.id, videoId: j.video_id, rawParts: j.raw_parts, rawSize: j.raw_size, rawName: j.raw_name, opts: JSON.parse(j.opts || '{}'), hasCover: !!v?.cover, title: v?.title }; };
+  const jobOut = (j) => { const v = db.get('SELECT * FROM videos WHERE id = ?', j.video_id); return { id: j.id, videoId: j.video_id, rawParts: j.raw_parts, rawSize: j.raw_size, rawName: j.raw_name, opts: JSON.parse(j.opts || '{}'), hasCover: !!v?.cover, title: v?.title, date: v?.stream_date, tags: JSON.parse(v?.tags || '[]'), description: v?.description || '' }; };
   r.post('/api/encoder/claim', async (req) => {
     encAuth(req); const b = await readJson(req);
     const name = String(b.name || 'encoder').slice(0, 40);
     app.encoders.set(name, { t: Date.now(), caps: b.caps || {}, ver: b.ver, busy: false });
-    const j = db.get("SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1");
+    // задачи «по ссылке» (авто-нарезка) берёт только ферма с caps.autocut
+    const j = db.get(`SELECT * FROM jobs WHERE status = 'queued' ${b.caps?.autocut ? '' : "AND json_extract(COALESCE(opts, '{}'), '$.url') IS NULL"} ORDER BY id LIMIT 1`);
     if (!j) return { job: null };
     db.run("UPDATE jobs SET status = 'encoding', encoder = ?, beat_at = ?, updated_at = ?, progress = 0 WHERE id = ?", name, Date.now(), Date.now(), j.id);
     db.run("UPDATE videos SET status = 'encoding' WHERE id = ?", j.video_id);
@@ -264,6 +265,10 @@ module.exports = (app, r) => {
     const v = db.get('SELECT * FROM videos WHERE id = ?', j.video_id); if (!v) fail(404, 'video');
     const media = b.media; if (!media || !Array.isArray(media.renditions) || !media.renditions.length) fail(400, 'media');
     db.run("UPDATE videos SET media = ?, duration = ?, size_bytes = ?, status = 'ready', cover = COALESCE(cover, ?), updated_at = ? WHERE id = ?", JSON.stringify(media), Number(b.duration) || 0, Number(b.size) || 0, b.cover || null, Date.now(), v.id);
+    if (b.stay) { // авто-нарезка: полное видео готово, но задача продолжается (расшифровка → нарезка)
+      db.run('UPDATE jobs SET beat_at = ?, updated_at = ? WHERE id = ?', Date.now(), Date.now(), j.id); app.bump(); log('job full video ready', j.id, v.id);
+      return { ok: true };
+    }
     db.run("UPDATE jobs SET status = 'done', progress = 1, updated_at = ? WHERE id = ?", Date.now(), j.id);
     const e = app.encoders.get(j.encoder); if (e) e.busy = false;
     app.bump(); log('job done', j.id, v.id);
@@ -275,10 +280,75 @@ module.exports = (app, r) => {
     encAuth(req); const b = await readJson(req);
     const j = db.get('SELECT * FROM jobs WHERE id = ?', Number(req.params.id)); if (!j) fail(404, 'job');
     db.run("UPDATE jobs SET status = 'error', error = ?, updated_at = ? WHERE id = ?", String(b.error || 'unknown').slice(0, 2000), Date.now(), j.id);
-    db.run("UPDATE videos SET status = 'error' WHERE id = ?", j.video_id);
+    db.run("UPDATE videos SET status = 'error' WHERE id = ? AND status != 'ready'", j.video_id);
+    app.dropParts?.(j);
     const e = app.encoders.get(j.encoder); if (e) e.busy = false;
     return { ok: true };
   });
+  // ---------- авто-нарезка (ферма) ----------
+  const jobOf = (req) => { const j = db.get('SELECT * FROM jobs WHERE id = ?', Number(req.params.id)); if (!j) fail(404, 'job'); return j; };
+  const acOpts = (j) => JSON.parse(j.opts || '{}');
+  const cleanTags = (a) => JSON.stringify([...new Set((Array.isArray(a) ? a : String(a || '').split(',')).map((t) => String(t).trim().toLowerCase().replace(/^#/, '')).filter(Boolean))].slice(0, 20));
+  // метаданные, которые стали известны по ходу: название/дата из источника, где лежит скачанный исходник
+  r.post('/api/encoder/jobs/:id/meta', async (req) => {
+    encAuth(req); const b = await readJson(req, 256 * 1024); const j = jobOf(req);
+    const v = db.get('SELECT * FROM videos WHERE id = ?', j.video_id); if (!v) fail(404, 'video');
+    if (b.raw_parts !== undefined) db.run('UPDATE jobs SET raw_parts = ?, raw_size = ?, raw_name = ?, updated_at = ? WHERE id = ?', Number(b.raw_parts) || 0, Number(b.raw_size) || 0, String(b.raw_name || j.raw_name || '').slice(0, 200), Date.now(), j.id);
+    const set = {};
+    if (b.title) set.title = String(b.title).trim().slice(0, 200);
+    if (b.description !== undefined) set.description = String(b.description).slice(0, 5000);
+    if (b.stream_date && /^\d{4}-\d{2}-\d{2}$/.test(b.stream_date)) set.stream_date = b.stream_date;
+    if (b.tags) set.tags = cleanTags(b.tags);
+    const keys = Object.keys(set);
+    if (keys.length) { db.run(`UPDATE videos SET ${keys.map((k) => k + ' = ?').join(', ')}, updated_at = ? WHERE id = ?`, ...keys.map((k) => set[k]), Date.now(), v.id); db.ftsSync(db.get('SELECT * FROM videos WHERE id = ?', v.id)); app.bump(); }
+    return { ok: true };
+  });
+  // создать видео-части (пока скрытые, status=encoding); повторный вызов вернёт те же id
+  r.post('/api/encoder/jobs/:id/parts', async (req) => {
+    encAuth(req); const b = await readJson(req, 1 << 20); const j = jobOf(req);
+    const o = acOpts(j), ac = o.autocut || (o.autocut = {});
+    if (Array.isArray(ac.partIds) && ac.partIds.length && ac.partIds.every((id) => db.get('SELECT 1 FROM videos WHERE id = ?', id))) return { ids: ac.partIds };
+    const parent = db.get('SELECT * FROM videos WHERE id = ?', j.video_id); if (!parent) fail(404, 'video');
+    const parts = (Array.isArray(b.parts) ? b.parts : []).slice(0, 60);
+    const ids = db.tx(() => parts.map((p) => {
+      const v = app.createVideo({ title: p.title, description: p.description || '', tags: [...JSON.parse(parent.tags || '[]'), ...(Array.isArray(p.tags) ? p.tags : [])], stream_date: parent.stream_date, status: 'encoding', visibility: ac.visibility === 'hidden' ? 'hidden' : 'public' });
+      return v.id;
+    }));
+    ac.partIds = ids; db.run('UPDATE jobs SET opts = ?, updated_at = ? WHERE id = ?', JSON.stringify(o), Date.now(), j.id);
+    log('autocut parts created', j.id, ids.length);
+    return { ids };
+  });
+  // финал: части готовы, главы/субтитры для полного стрима, уборка
+  r.post('/api/encoder/jobs/:id/autocut', async (req) => {
+    encAuth(req); const b = await readJson(req, 8 << 20); const j = jobOf(req);
+    const o = acOpts(j), ac = o.autocut || {};
+    const parent = db.get('SELECT * FROM videos WHERE id = ?', j.video_id);
+    const ready = [];
+    for (const p of Array.isArray(b.parts) ? b.parts : []) {
+      if (!(ac.partIds || []).includes(p.id) || !p.media?.renditions?.length) continue;
+      db.run("UPDATE videos SET media = ?, duration = ?, size_bytes = ?, status = 'ready', cover = COALESCE(?, cover), updated_at = ? WHERE id = ?", JSON.stringify(p.media), Number(p.duration) || 0, Number(p.size) || 0, p.cover || null, Date.now(), p.id);
+      ready.push(p.id);
+    }
+    for (const id of ac.partIds || []) if (!ready.includes(id)) app.deleteVideo?.(id, 'autocut: часть не собрана');
+    let keepFull = ac.keepFull !== false || !ready.length;
+    if (parent) {
+      const media = parent.media ? JSON.parse(parent.media) : null;
+      if (media && b.subs) { media.subs = b.subs; db.run('UPDATE videos SET media = ? WHERE id = ?', JSON.stringify(media), parent.id); }
+      if (Array.isArray(b.chapters)) db.run('UPDATE videos SET chapters = ? WHERE id = ?', JSON.stringify(b.chapters.filter((c) => c && c.t >= 0 && c.title).map((c) => ({ t: Math.round(c.t), title: String(c.title).slice(0, 120) })).slice(0, 300)), parent.id);
+      if (b.title && ac.autoTitle) { db.run('UPDATE videos SET title = ? WHERE id = ?', String(b.title).slice(0, 200), parent.id); }
+      if (keepFull && parent.visibility !== (ac.visibility === 'hidden' ? 'hidden' : 'public')) db.run('UPDATE videos SET visibility = ? WHERE id = ?', ac.visibility === 'hidden' ? 'hidden' : 'public', parent.id);
+      db.ftsSync(db.get('SELECT * FROM videos WHERE id = ?', parent.id));
+    }
+    const rawGone = j.raw_parts && !db.setting('site.keepRaw', false);
+    db.run("UPDATE jobs SET status = 'done', progress = 1, error = ?, raw_parts = ?, updated_at = ? WHERE id = ?", b.failed ? String(b.failed).slice(0, 2000) : null, rawGone ? 0 : j.raw_parts, Date.now(), j.id);
+    if (rawGone) app.deleteRaw(j.video_id, j.raw_parts).catch(() => {});
+    if (parent && !keepFull) app.deleteVideo?.(parent.id, 'autocut: полный стрим не нужен');
+    app.bump(); log('autocut done', j.id, 'parts', ready.length, b.failed ? 'failed: ' + b.failed : '');
+    if (ac.visibility !== 'hidden' && db.setting('site.notifyNew', true)) { if (ready.length) app.announceParts(parent, ready, keepFull); else if (parent) app.announceVideo(parent.id); }
+    return { ok: true, ready: ready.length };
+  });
+  app.dropParts = (j) => { const ac = acOpts(j).autocut; for (const id of ac?.partIds || []) { const v = db.get('SELECT status FROM videos WHERE id = ?', id); if (v && v.status !== 'ready') app.deleteVideo?.(id, 'autocut: отмена'); } };
+
   r.post('/api/encoder/cover/:vid', async (req) => {
     encAuth(req);
     const buf = await readBody(req, 3 << 20); const ext = IMG(buf); if (!ext) fail(400, 'img');
@@ -304,6 +374,14 @@ module.exports = (app, r) => {
     if (!chats.length) return;
     const h = Math.floor(v.duration / 3600), m = Math.floor((v.duration % 3600) / 60);
     app.notifyBot({ chats, text: `📼 Новая запись в архиве\n\n<b>${esc(v.title)}</b>\n${v.stream_date} · ${h}ч ${m}м`, url: `${cfg.publicUrl}/v/${v.id}`, button: '▶ Смотреть' });
+  };
+  app.announceParts = (parent, ids, keepFull) => {
+    const chats = db.all('SELECT tg_id FROM users WHERE notify = 1 AND tg_id IS NOT NULL AND (ban_until = 0 OR (ban_until > 0 AND ban_until < ?))', Date.now()).map((x) => x.tg_id);
+    if (!chats.length) return;
+    const vs = ids.map((id) => db.get('SELECT id, title, duration FROM videos WHERE id = ?', id)).filter(Boolean);
+    const dur = (d) => { const h = Math.floor(d / 3600), m = Math.floor((d % 3600) / 60); return h ? `${h}ч ${m}м` : `${m} мин`; };
+    const list = vs.slice(0, 20).map((v) => `• <a href="${cfg.publicUrl}/v/${v.id}">${esc(v.title)}</a> · ${dur(v.duration)}`).join('\n') + (vs.length > 20 ? `\n… и ещё ${vs.length - 20}` : '');
+    app.notifyBot({ chats, text: `✂️ Нарезка со стрима${parent ? ' <b>' + esc(parent.title) + '</b>' : ''}\n\n${list}`, url: `${cfg.publicUrl}/v/${keepFull && parent ? parent.id : vs[0].id}`, button: '▶ Смотреть' });
   };
   const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
   app.esc = esc;

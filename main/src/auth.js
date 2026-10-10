@@ -121,7 +121,7 @@ module.exports = (app) => {
     if (Math.random() < 0.05) db.run('DELETE FROM sessions WHERE expires_at < ?', now);
     // stale encoder jobs → back to queue
     const stale = db.all("SELECT id, video_id FROM jobs WHERE status = 'encoding' AND local = 0 AND beat_at < ?", now - 10 * 60e3);
-    for (const j of stale) { db.run("UPDATE jobs SET status = 'queued', encoder = NULL, updated_at = ? WHERE id = ?", now, j.id); db.run("UPDATE videos SET status = 'queued' WHERE id = ?", j.video_id); log('job requeued', j.id); }
+    for (const j of stale) { db.run("UPDATE jobs SET status = 'queued', encoder = NULL, updated_at = ? WHERE id = ?", now, j.id); db.run("UPDATE videos SET status = 'queued' WHERE id = ? AND status != 'ready'", j.video_id); log('job requeued', j.id); }
     db.run("UPDATE jobs SET status = 'error', error = 'local encoder lost' WHERE status = 'encoding' AND local = 1 AND beat_at < ?", now - 60 * 60e3);
   };
 };

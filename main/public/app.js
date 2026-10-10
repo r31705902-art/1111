@@ -208,7 +208,7 @@ async function watch(id) {
   const saved = Math.max(v.progress || 0, progMap()[id] || 0);
   const start = P.get('t') ? +P.get('t') : saved > 30 && saved < v.dur - 60 ? saved : 0;
   let lastSent = 0;
-  S.player = new window.VNPlayer($('#pl'), { bases, path: `/p/${pr.token}/${id}/`, dur: v.dur, start, chapters: v.chapters, sb: v.sb, title: v.title, cover: v.cover,
+  S.player = new window.VNPlayer($('#pl'), { bases, path: `/p/${pr.token}/${id}/`, dur: v.dur, start, chapters: v.chapters, sb: v.sb, subs: v.subs, title: v.title, cover: v.cover,
     refresh: async () => { const r = await playReq(id); return { path: `/p/${r.token}/${id}/`, bases: await pickNodes(r.nodes) }; },
     onProgress: (t, d, final) => {
       const m = progMap(); m[id] = Math.round(t); const keys = Object.keys(m); if (keys.length > 300) delete m[keys[0]]; LS.set('vn_prog', m);

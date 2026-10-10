@@ -15,15 +15,15 @@ function spark(pts, w = 110, hgt = 28) {
   const p = pts.map((v, i) => `${(i * step).toFixed(1)},${(hgt - 2 - (v / mx) * (hgt - 4)).toFixed(1)}`);
   return `<svg class="spark" viewBox="0 0 ${w} ${hgt}" preserveAspectRatio="none"><path class="a" d="M0,${hgt} L${p.join(' L')} L${w},${hgt}Z"/><path d="M${p.join(' L')}"/></svg>`;
 }
-const TABS = [['overview', 'Обзор', '◎'], ['videos', 'Видео', '▶'], ['upload', 'Загрузка', '↑'], ['users', 'Пользователи', '◉'], ['servers', 'Серверы · рой', '◆'], ['jobs', 'Кодировщик', '⚙'], ['settings', 'Настройки', '≡'], ['audit', 'Журнал', '≡']];
+const TABS = [['overview', 'Обзор', '◎'], ['videos', 'Видео', '▶'], ['upload', 'Загрузка', '↑'], ['autocut', 'Авто-нарезка', '✂'], ['users', 'Пользователи', '◉'], ['servers', 'Серверы · рой', '◆'], ['jobs', 'Кодировщик', '⚙'], ['settings', 'Настройки', '≡'], ['audit', 'Журнал', '≡']];
 const STATE_RU = { online: 'в сети', idle: 'простой', dozing: 'дремлет', sleeping: 'спит', waking: 'просыпается', draining: 'слив', budget: 'лимит трафика', offline: 'нет связи', disabled: 'выключен', unknown: 'неизвестно' };
 
 function render(view, tab, ctx) {
   C = ctx; clearInterval(timer);
   const staffOnly = C.S.me.role !== 'admin';
-  view.innerHTML = `<div class="adm"><nav class="adm-nav"><div class="lbl">sys.admin</div>${TABS.filter(([k]) => !(staffOnly && ['upload', 'settings'].includes(k))).map(([k, l, i]) => `<a href="/admin/${k}" class="${k === tab ? 'on' : ''}"><span class="mono">${i}</span>${l}</a>`).join('')}</nav><div id="ac"></div></div>`;
+  view.innerHTML = `<div class="adm"><nav class="adm-nav"><div class="lbl">sys.admin</div>${TABS.filter(([k]) => !(staffOnly && ['upload', 'autocut', 'settings'].includes(k))).map(([k, l, i]) => `<a href="/admin/${k}" class="${k === tab ? 'on' : ''}"><span class="mono">${i}</span>${l}</a>`).join('')}</nav><div id="ac"></div></div>`;
   const el = $('#ac');
-  const fn = { overview, videos, upload, users, servers, jobs, settings, audit }[tab] || overview;
+  const fn = { overview, videos, upload, autocut, users, servers, jobs, settings, audit }[tab] || overview;
   return fn(el).catch((e) => { el.innerHTML = `<div class="empty err">${C.h(e.message)}</div>`; });
 }
 const live = (el, fn, ms) => { timer = setInterval(() => { if (!el.isConnected) return clearInterval(timer); fn().catch(() => {}); }, ms); };
@@ -177,6 +177,62 @@ async function doUpload(file, meta, profile, host) {
     S('✓ в очереди кодировщика'); box.querySelector('.prog i').style.width = '100%';
     box.querySelector('[data-d]').innerHTML = `Готово. Видео <a class="ac" href="/admin/jobs">ждёт кодировщик</a> — он сожмёт его в AV1/H.264 и выложит в рой.`;
   } catch (e) { S('ошибка'); box.querySelector('[data-d]').innerHTML = `<span class="err">${C.h(e.message)}</span> — выбери тот же файл снова, загрузка продолжится.`; }
+}
+
+// ---------- авто-нарезка ----------
+const STAGE_RU = { download: 'скачивание', encode: 'кодирование + расшифровка', asr: 'расшифровка', llm: 'нейросеть режет', parts: 'сборка частей', finish: 'публикация' };
+async function autocut(el) {
+  let r = await C.api('/api/admin/autocut');
+  const c = r.cfg;
+  el.innerHTML = `<h1>Авто-нарезка стрима</h1>
+    <div class="cols2"><div class="panel">
+      <label class="field"><span>Ссылка на стрим / VOD (Twitch, YouTube, VK, Kick… всё, что умеет yt-dlp)</span><input class="inp" id="acu" placeholder="https://www.twitch.tv/videos/…"></label>
+      <div class="cols2"><label class="field"><span>Стример (как писать в названиях)</span><input class="inp" id="acs" value="${C.h(c.streamer || '')}"></label>
+        <label class="field"><span>Язык речи</span><select class="inp" id="acl"><option value="ru">русский</option><option value="auto">определить сам</option><option value="uk">украинский</option><option value="en">английский</option></select></label></div>
+      <div class="cols2"><label class="field"><span>Название полного стрима (пусто = придумает нейросеть)</span><input class="inp" id="act" maxlength="200"></label>
+        <label class="field"><span>Дата (пусто = из источника)</span><input class="inp" type="date" id="acd"></label></div>
+      <div class="cols2"><label class="field"><span>Теги для всех частей</span><input class="inp" id="actg" placeholder="нарезка, t2x2"></label>
+        <label class="field"><span>Профиль сжатия</span><select class="inp" id="acp"><option value="av1">AV1 + H.264 480p</option><option value="av1compat">AV1 + H.264 720p</option><option value="h264">Только H.264</option><option value="lite">Лайт: до 720p</option></select></label></div>
+      <label class="field"><span>Части короче, мин — склеивать с соседними</span><input class="inp" type="number" id="acm" value="${c.minPart || 8}" min="1" max="120"></label>
+      <label class="sw"><input type="checkbox" id="aci" ${c.intro ? 'checked' : 'disabled'}> Вступление в начале каждой части ${c.intro ? '' : '<span class="mu">(сначала загрузи его справа)</span>'}</label>
+      <label class="sw" style="margin-top:10px"><input type="checkbox" id="ack" checked> Оставить полный стрим на сайте (с главами и субтитрами)</label>
+      <label class="sw" style="margin-top:10px"><input type="checkbox" id="acc" checked> Нарезать на части (выкл = только полный стрим + субтитры)</label>
+      <label class="sw" style="margin-top:10px"><input type="checkbox" id="ach"> Скрыть из каталога (только по ссылке)</label>
+      <button class="btn pri" id="acgo" style="width:100%;margin-top:16px;height:44px">✂ Скачать и нарезать</button></div>
+    <div><div class="panel"><div class="field"><span>Вступление</span></div><div id="acin"></div>
+        <input type="file" id="acif" accept="video/*" hidden><div style="display:flex;gap:8px;margin-top:10px"><button class="btn sm" id="acib">Загрузить файл…</button><button class="btn sm dan" id="acid" ${c.intro ? '' : 'disabled'}>Убрать</button></div>
+        <p class="hint" style="margin:10px 0 0">MP4 (H.264/AAC), 16:9, 1920×1080 или 1280×720, 3–15 секунд, со звуком (если звука нет — подставлю тишину). Загружается один раз — под каждый стрим ферма сама перекодирует его в те же качества и fps.</p></div>
+      <div class="panel" style="margin-top:18px"><div class="field"><span>Стиль названий — примеры для нейросети (по одному в строке)</span></div><textarea class="inp" id="acst" style="min-height:220px;font-size:12px">${C.h(c.style || '')}</textarea><button class="btn sm" id="acss" style="margin-top:10px">Сохранить стиль и стримера</button></div></div></div>
+    <h2 style="margin-top:28px">Задачи</h2><div id="acj"></div>`;
+  $('#acl', el).value = c.lang || 'ru';
+  const intro = () => { $('#acin', el).innerHTML = c.intro ? `🎬 <b>${C.h(c.intro.name)}</b> · ${B(c.intro.size)} · ${new Date(c.intro.at).toLocaleDateString('ru-RU')}` : '<span class="mu">не загружено</span>'; };
+  intro();
+  $('#acib', el).onclick = () => $('#acif', el).click();
+  $('#acif', el).onchange = () => {
+    const f = $('#acif', el).files[0]; if (!f) return;
+    const x = new XMLHttpRequest(); x.open('PUT', '/api/admin/autocut/intro?name=' + encodeURIComponent(f.name)); x.setRequestHeader('X-VN', '1');
+    x.upload.onprogress = (e) => { $('#acin', el).textContent = 'загрузка ' + Math.round((e.loaded / e.total) * 100) + '%'; };
+    x.onload = () => { if (x.status < 300) { Object.assign(c, JSON.parse(x.responseText)); C.toast('Вступление загружено', 'o'); autocut(el); } else C.toast(JSON.parse(x.responseText || '{}').error || 'Ошибка ' + x.status, 'e'); };
+    x.onerror = () => C.toast('сеть', 'e'); x.send(f);
+  };
+  $('#acid', el).onclick = async () => { await C.api('/api/admin/autocut/intro', { method: 'DELETE' }); autocut(el); };
+  $('#acss', el).onclick = () => run('/api/admin/autocut/config', { style: $('#acst', el).value, streamer: $('#acs', el).value, lang: $('#acl', el).value, minPart: +$('#acm', el).value }, 'Сохранено');
+  $('#acgo', el).onclick = async () => {
+    const b = { url: $('#acu', el).value, streamer: $('#acs', el).value, lang: $('#acl', el).value, title: $('#act', el).value, stream_date: $('#acd', el).value || undefined, tags: $('#actg', el).value, profile: $('#acp', el).value, minPart: +$('#acm', el).value,
+      intro: $('#aci', el).checked, keepFull: $('#ack', el).checked, cut: $('#acc', el).checked, visibility: $('#ach', el).checked ? 'hidden' : 'public' };
+    if (!b.cut && !b.keepFull) return C.toast('Нечего публиковать: включи нарезку или полный стрим', 'e');
+    await run('/api/admin/autocut', b, 'В очереди — ферма скоро возьмёт'); $('#acu', el).value = ''; $('#act', el).value = ''; draw();
+  };
+  const draw = async () => {
+    r = await C.api('/api/admin/autocut');
+    $('#acj', el).innerHTML = r.items.map((j) => { const i = j.info || {}; return `<div class="panel" style="margin-bottom:12px"><div style="display:flex;gap:12px;justify-content:space-between;align-items:center">
+        <div><a href="/admin/videos?edit=${j.video_id}"><b>${C.h(j.title || j.video_id)}</b></a><div class="mono mu" style="font-size:11px;word-break:break-all">${C.h(j.url || '')}</div></div>
+        <div style="text-align:right"><span class="pill ${j.status}">${j.status}</span><div class="mono mu" style="font-size:11px">#${j.id} · ${ago(j.created_at)} назад</div></div></div>
+      <div class="prog"><i style="width:${(j.progress || 0) * 100}%"></i></div>
+      <div class="mono" style="font-size:12px">${j.status === 'encoding' ? `${STAGE_RU[i.stage] || C.h(i.stage || '')} ${i.detail ? '· ' + C.h(i.detail) : ''}` : j.error ? `<span class="${j.status === 'done' ? 'warn' : 'err'}">${C.h(j.error.slice(0, 300))}</span>` : ''}</div>
+      ${j.parts.length ? `<div style="margin-top:8px">${j.parts.map((p) => `<div class="sess"><a href="/v/${p.id}">${C.h(p.title)}</a><span class="mono">${p.status === 'ready' ? C.fmt(p.duration) : p.status}</span></div>`).join('')}</div>` : ''}</div>`; }).join('') || '<div class="empty mu">Пока пусто</div>';
+  };
+  await draw(); live(el, draw, 8000);
 }
 
 // ---------- users ----------

@@ -80,6 +80,11 @@ module.exports = (app, r) => {
   r.del('/api/admin/videos/:id', async (req) => {
     const u = app.need(req, 'admin');
     const v = db.get('SELECT * FROM videos WHERE id = ?', req.params.id); if (!v) fail(404, 'Нет видео');
+    app.deleteVideo(v.id, null, u.id);
+    return { ok: true };
+  });
+  app.deleteVideo = (id, why, actor) => {
+    const v = db.get('SELECT * FROM videos WHERE id = ?', id); if (!v) return false;
     const jobs = db.all('SELECT raw_parts FROM jobs WHERE video_id = ?', v.id);
     db.tx(() => {
       for (const t of ['favorites', 'progress', 'jobs']) db.run(`DELETE FROM ${t} WHERE video_id = ?`, v.id);
@@ -87,10 +92,10 @@ module.exports = (app, r) => {
       db.run('DELETE FROM videos WHERE id = ?', v.id);
       db.run('DELETE FROM videos_fts WHERE id = ?', v.id);
     });
-    db.audit(u.id, 'video.delete', v.id, { title: v.title }); app.bump();
+    db.audit(actor || null, 'video.delete', v.id, { title: v.title, why: why || undefined }); app.bump();
     purgeVideo(v, jobs).catch((e) => log('purge failed', v.id, e.message));
-    return { ok: true };
-  });
+    return true;
+  };
   async function purgeVideo(v, jobs) {
     const names = new Set();
     const media = v.media ? JSON.parse(v.media) : null;
@@ -99,9 +104,10 @@ module.exports = (app, r) => {
       for (const rd of [...media.renditions, ...(media.audio ? [media.audio] : [])]) {
         names.add(`v/${v.id}/${rd.name}/index.m3u8`); names.add(`v/${v.id}/${rd.name}/init.mp4`);
         const pl = await swift.getBuffer(`v/${v.id}/${rd.name}/index.m3u8`).catch(() => null);
-        if (pl) for (const line of pl.buf.toString().split('\n')) { const s = line.trim(); if (s && !s.startsWith('#')) names.add(`v/${v.id}/${rd.name}/${s}`); }
+        if (pl) for (const line of pl.buf.toString().split('\n')) { const s = line.trim(); const mu = /^#EXT-X-MAP:URI="([^"]+)"/.exec(s); if (mu) names.add(`v/${v.id}/${rd.name}/${mu[1]}`); if (s && !s.startsWith('#')) names.add(`v/${v.id}/${rd.name}/${s}`); }
         else for (let i = 0; i < (rd.segs || 0) + 2; i++) names.add(`v/${v.id}/${rd.name}/seg_${String(i).padStart(5, '0')}.m4s`);
       }
+      if (media.subs) names.add(`v/${v.id}/subs.json`);
       if (media.sb) { names.add(`v/${v.id}/sb/index.json`); for (let i = 1; i <= media.sb.sheets; i++) names.add(`v/${v.id}/sb/sb_${String(i).padStart(3, '0')}.${media.sb.ext || 'webp'}`); }
     }
     for (const o of await swift.list(`v/${v.id}/`).catch(() => [])) names.add(o.name);
@@ -163,16 +169,86 @@ module.exports = (app, r) => {
     const u = app.need(req, 'admin');
     const j = db.get('SELECT * FROM jobs WHERE id = ?', Number(req.params.id)); if (!j) fail(404, 'job');
     if (req.params.action === 'retry') {
-      if (!j.raw_parts) fail(400, 'Нет исходника в хранилище (локальный ingest) — перезапусти кодировщик с файлом');
-      db.run("UPDATE jobs SET status = 'queued', error = NULL, progress = 0, encoder = NULL, updated_at = ? WHERE id = ?", Date.now(), j.id);
+      const o = JSON.parse(j.opts || '{}');
+      if (!j.raw_parts && !o.url) fail(400, 'Нет исходника в хранилище (локальный ingest) — перезапусти кодировщик с файлом');
+      if (o.autocut) { app.dropParts(j); o.autocut.partIds = []; }
+      db.run("UPDATE jobs SET status = 'queued', error = NULL, progress = 0, encoder = NULL, opts = ?, updated_at = ? WHERE id = ?", JSON.stringify(o), Date.now(), j.id);
       db.run("UPDATE videos SET status = 'queued' WHERE id = ?", j.video_id);
     } else if (req.params.action === 'cancel') {
       db.run("UPDATE jobs SET status = 'canceled', updated_at = ? WHERE id = ?", Date.now(), j.id);
+      app.dropParts(j);
       db.run("UPDATE videos SET status = 'error' WHERE id = ? AND status != 'ready'", j.video_id);
     } else fail(400, 'action');
     db.audit(u.id, 'job.' + req.params.action, j.id); app.bump();
     return { ok: true };
   });
+
+  // ---------- авто-нарезка: ссылка на стрим → ферма скачает, закодирует, расшифрует, нарежет ----------
+  const DEFAULT_STYLE = `T2x2 СМОТРИТ: С МАМАМИ МАЛЬЧИКОВ ЧТО-ТО НЕ ТАК
+T2x2 ИГРАЕТ в BACKROOM COMPANY / МАЗЕЛЛОВ, Laufeech
+T2x2 СМОТРИТ: думаешь тебя трудно НАПУГАТЬ?
+T2x2 СМОТРИТ: УЖАСЫ, КОТОРЫЕ ВАМ НЕ ПОКАЗАЛИ В ФИЛЬМАХ
+T2x2 ИГРАЕТ в HAPPY WHEELS
+T2x2 СМОТРИТ: Я Приготовил Ютуберам Их Последние Блюда
+T2x2 СМОТРИТ: Съешь Всё В Продуктовом Магазине, Выиграй $1,000,000
+T2x2 СМОТРИТ: 🎉 Угадай 50 ПЕРСОНАЖЕЙ по голосу! Большой EmojiCool Челлендж! 🎤
+T2x2 И АСЛАН ШУКАША УСТРАИВАЮТ ПРОВЕРКУ УЧИТЕЛЯМ / ШОУ ИНТУИЦИЯ
+T2x2 ПРОХОДИТ МАЙНКРАФТ СБОРКУ с АЛЬТУШКОЙ
+T2x2 СМОТРИТ: Уйти любой ценой / 6 диких погонь
+T2x2 СМОТРИТ: 1 000 муравьёв VS испытания
+T2x2 СМОТРИТ: Аварии на реальных событиях в BeamNG.Drive #71
+T2x2 УЧИТ СЕСТРУ ВОДИТЬ МАШИНУ
+T2x2 ИГРАЕТ в СИМУЛЯТОР ЖЕНЩИНЫ
+T2x2 СМОТРИТ: ВСЕ НЕНАВИДЯТ СИДНИ СУИНИ
+T2x2 СМОТРИТ: ВСЕ МЕМЫ СЕНТЯБРЯ
+T2x2 ИГРАЕТ в ПРИВЕТ СОСЕД 2 - Hello Neighbor 2 #2
+T2x2 СМОТРИТ: Айсберг УЖАСОВ ТИКТОКА
+T2x2 СМОТРИТ: Minecraft Live - Обновление 26.4 | Ледяное Обновление и Новое измерение Сифт
+T2x2 СТРИМ В ГАРАЖЕ`;
+  const acCfg = () => ({ intro: db.setting('autocut.intro', null), style: db.setting('autocut.style', DEFAULT_STYLE), streamer: db.setting('autocut.streamer', 'T2x2'), minPart: db.setting('autocut.minPart', 8), lang: db.setting('autocut.lang', 'ru') });
+  r.get('/api/admin/autocut', (req) => {
+    app.need(req, 'mod');
+    const items = db.all("SELECT j.id, j.video_id, j.status, j.progress, j.info, j.error, j.opts, j.created_at, j.updated_at, v.title FROM jobs j LEFT JOIN videos v ON v.id = j.video_id WHERE json_extract(COALESCE(j.opts, '{}'), '$.url') IS NOT NULL ORDER BY j.id DESC LIMIT 30")
+      .map((j) => { const o = JSON.parse(j.opts || '{}'); return { ...j, opts: undefined, url: o.url, info: j.info ? JSON.parse(j.info) : null, parts: (o.autocut?.partIds || []).map((id) => db.get('SELECT id, title, status, duration FROM videos WHERE id = ?', id)).filter(Boolean) }; });
+    return { cfg: acCfg(), items };
+  });
+  r.post('/api/admin/autocut/config', async (req) => {
+    const me = app.need(req, 'admin'); const b = await readJson(req, 64 * 1024);
+    if (b.style !== undefined) db.setSetting('autocut.style', String(b.style).slice(0, 20000));
+    if (b.streamer !== undefined) db.setSetting('autocut.streamer', String(b.streamer).trim().slice(0, 60));
+    if (b.minPart !== undefined) db.setSetting('autocut.minPart', Math.min(120, Math.max(1, Number(b.minPart) || 8)));
+    if (b.lang !== undefined) db.setSetting('autocut.lang', String(b.lang).slice(0, 8));
+    db.audit(me.id, 'autocut.config'); return acCfg();
+  });
+  r.post('/api/admin/autocut', async (req) => {
+    const u = app.need(req, 'admin'); const b = await readJson(req, 64 * 1024);
+    const url = String(b.url || '').trim();
+    if (!/^https?:\/\/[^\s]{4,2000}$/i.test(url)) fail(400, 'Нужна ссылка на стрим/VOD (https://…)');
+    const c = acCfg();
+    const keepFull = b.keepFull !== false, vis = b.visibility === 'hidden' ? 'hidden' : 'public';
+    const v = app.createVideo({ title: b.title || 'Стрим (скачивается…)', stream_date: b.stream_date || undefined, tags: b.tags, description: b.description, status: 'queued', visibility: keepFull ? vis : 'hidden' });
+    const opts = { profile: b.profile || db.setting('enc.profile', 'av1'), url, autocut: {
+      keepFull, visibility: vis, autoTitle: !String(b.title || '').trim(), autoDate: !b.stream_date, streamer: String(b.streamer || c.streamer || '').slice(0, 60),
+      lang: String(b.lang || c.lang || 'ru').slice(0, 8), intro: b.intro !== false && c.intro ? c.intro : null, style: c.style, minPart: Number(b.minPart) || c.minPart, cut: b.cut !== false, partIds: [] } };
+    const now = Date.now();
+    db.run("INSERT INTO jobs(video_id, status, raw_parts, raw_size, raw_name, opts, created_at, updated_at) VALUES(?, 'queued', 0, 0, ?, ?, ?, ?)", v.id, url.slice(0, 200), JSON.stringify(opts), now, now);
+    db.audit(u.id, 'autocut.add', v.id, { url }); app.bump();
+    return { ok: true, videoId: v.id };
+  });
+  // вступление: один файл в Blomp (sys/intro/…), ферма сама перекодирует его под каждый стрим
+  r.put('/api/admin/autocut/intro', async (req) => {
+    const u = app.need(req, 'admin');
+    const len = Number(req.headers['content-length']); if (!(len > 1000) || len > 300 * 1048576) fail(400, 'Вступление: файл до 300 МБ');
+    const name = String(req.query.get('name') || 'intro.mp4').slice(0, 120); const ext = (/\.(mp4|mov|mkv|webm)$/i.exec(name)?.[1] || 'mp4').toLowerCase();
+    const key = `sys/intro/intro_${rid(6)}.${ext}`;
+    const res = await swift.req('PUT', key, { headers: { 'Content-Length': len, 'Content-Type': 'application/octet-stream' }, body: req, timeout: 900000 });
+    res.resume(); if (res.statusCode >= 300) fail(502, 'Blomp отклонил файл: ' + res.statusCode);
+    const old = db.setting('autocut.intro', null);
+    db.setSetting('autocut.intro', { key, size: len, name, at: Date.now() });
+    if (old?.key) swift.del(old.key).catch(() => {});
+    db.audit(u.id, 'autocut.intro', key); return acCfg();
+  });
+  r.del('/api/admin/autocut/intro', (req) => { const u = app.need(req, 'admin'); const old = db.setting('autocut.intro', null); if (old?.key) swift.del(old.key).catch(() => {}); db.setSetting('autocut.intro', null); db.audit(u.id, 'autocut.intro.del'); return acCfg(); });
 
   // ---------- users ----------
   r.get('/api/admin/users', (req) => {

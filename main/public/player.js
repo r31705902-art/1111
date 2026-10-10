@@ -50,7 +50,7 @@ class Engine {
     for (const l of txt.split('\n')) {
       if (l.startsWith('#EXT-X-MAP:')) init = dir + attrs(l.slice(11)).URI;
       else if (l.startsWith('#EXTINF:')) d = parseFloat(l.slice(8));
-      else if (l && !l.startsWith('#')) { segs.push({ uri: dir + l.trim(), s: start, d }); start += d; }
+      else if (l && !l.startsWith('#')) { segs.push({ uri: dir + l.trim(), s: start, d, init }); start += d; }
     }
     const m = { init, segs, dur: start }; this.pl.set(r.uri, m); return m;
   }
@@ -157,8 +157,8 @@ class Engine {
       let idx = segAt(m.segs, this.bufEnd(t) + 0.08);
       if (t.last >= 0 && idx <= t.last && t.lastRend === rend.uri) idx = t.last + 1;
       if (idx >= m.segs.length) { t.ended = true; this.maybeEnd(); return; }
-      if (t.init !== rend.uri) { const ib = await this.fetchBuf(m.init, 'init'); await this.append(t, ib); t.init = rend.uri; }
-      const seg = m.segs[idx];
+      const seg = m.segs[idx], iu = seg.init || m.init; // у вступления свой init (EXT-X-MAP перед сегментом)
+      if (t.init !== iu) { const ib = await this.fetchBuf(iu, 'init'); await this.append(t, ib); t.init = iu; }
       const buf = await this.fetchBuf(seg.uri, 'seg');
       if (this.dead) return;
       await this.append(t, buf);
@@ -224,6 +224,7 @@ class VNPlayer {
           <span class="vp-sp"></span>
           <button class="vp-b vp-txt" data-a="speed" title="Скорость">1×</button>
           <button class="vp-b vp-txt vp-q" data-a="quality" title="Качество">АВТО</button>
+          ${o.subs ? '<button class="vp-b vp-txt vp-cc" data-a="cc" title="Субтитры (C)">CC</button>' : ''}
           <button class="vp-b" data-a="stats" title="Статистика">${svg('info')}</button>
           <button class="vp-b" data-a="pip" title="Картинка в картинке">${svg('pip')}</button>
           <button class="vp-b" data-a="theater" title="Театр (T)">${svg('th')}</button>
@@ -239,6 +240,23 @@ class VNPlayer {
     v.volume = LS.get('vn_vol', 0.8); v.muted = LS.get('vn_muted', false); v.playbackRate = LS.get('vn_speed', 1);
     this.bind(); this.renderChapters(); this.syncVol(); this.el.speed.textContent = v.playbackRate + '×';
     this.start(o.start || 0);
+    if (o.subs && LS.get('vn_cc', false)) setTimeout(() => this.cc(true), 500);
+  }
+  async cc(on) {
+    const v = this.el.v, btn = this.el.vp.querySelector('.vp-cc');
+    if (on === undefined) on = !(this.track && this.track.mode === 'showing');
+    LS.set('vn_cc', on);
+    if (!on) { if (this.track) this.track.mode = 'hidden'; btn?.classList.remove('on'); return; }
+    if (!this.track) {
+      for (let i = 0; i < 40 && !this.engine; i++) await new Promise((r) => setTimeout(r, 100));
+      try {
+        const j = JSON.parse(new TextDecoder().decode(await this.engine.fetchBuf('subs.json', 'pl')));
+        this.track = v.addTextTrack('subtitles', 'Русский', j.lang || 'ru');
+        const C = window.VTTCue || window.TextTrackCue;
+        for (const [a, b, , text] of j.cues || []) { const c = new C(a, b, text); c.line = -2; c.snapToLines = true; this.track.addCue(c); }
+      } catch (e) { this.toast('Субтитры недоступны'); return; }
+    }
+    this.track.mode = 'showing'; btn?.classList.add('on');
   }
   async start(at) {
     const o = this.o;
@@ -299,7 +317,7 @@ class VNPlayer {
     const v = this.el.v, k = e.key;
     const map = { ' ': () => this.toggle(), k: () => this.toggle(), 'л': () => this.toggle(), j: () => this.seekBy(-10), 'о': () => this.seekBy(-10), l: () => this.seekBy(10), 'д': () => this.seekBy(10), ArrowLeft: () => this.seekBy(-5), ArrowRight: () => this.seekBy(5),
       ArrowUp: () => { v.volume = Math.min(1, v.volume + 0.05); v.muted = false; this.flash(Math.round(v.volume * 100) + '%'); }, ArrowDown: () => { v.volume = Math.max(0, v.volume - 0.05); this.flash(Math.round(v.volume * 100) + '%'); },
-      m: () => this.act('mute'), 'ь': () => this.act('mute'), f: () => this.fs(), 'а': () => this.fs(), t: () => this.act('theater'), 'е': () => this.act('theater'),
+      c: () => this.o.subs && this.cc(), 'с': () => this.o.subs && this.cc(), m: () => this.act('mute'), 'ь': () => this.act('mute'), f: () => this.fs(), 'а': () => this.fs(), t: () => this.act('theater'), 'е': () => this.act('theater'),
       '>': () => this.rate(0.25), '<': () => this.rate(-0.25), Home: () => (v.currentTime = 0), End: () => (v.currentTime = this.D() - 1),
       PageDown: () => this.chapterJump(1), PageUp: () => this.chapterJump(-1) };
     if (/^[0-9]$/.test(k) && !e.ctrlKey && !e.metaKey) { e.preventDefault(); v.currentTime = (this.D() * Number(k)) / 10; return; }
@@ -365,6 +383,7 @@ class VNPlayer {
       case 'fs': return this.fs();
       case 'pip': if (document.pictureInPictureElement) document.exitPictureInPicture(); else v.requestPictureInPicture?.().catch(() => this.toast('PiP недоступен')); return;
       case 'theater': document.body.classList.toggle('theater'); LS.set('vn_theater', document.body.classList.contains('theater')); return;
+      case 'cc': return this.cc();
       case 'stats': this.el.stats.hidden = !this.el.stats.hidden; this.renderStats(); return;
       case 'speed': return this.menu(btn, [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3].map((x) => ({ v: x, l: x + '×' })), v.playbackRate, (x) => (v.playbackRate = +x), 'Скорость');
       case 'quality': {
